@@ -3204,8 +3204,142 @@ auto ExpressionAnalyzer::ResolveGeneric(const Symbol &symbol,
   const Symbol *elemental{nullptr}; // matching elemental specific proc
   const Symbol *nonElemental{nullptr}; // matching non-elemental specific
   const auto *genericDetails{ultimate.detailsIf<semantics::GenericDetails>()};
+  if (genericDetails) {
+    int crtMatchingDistance{cudaInfMatchingValue};
+    for (const Symbol &specific0 : genericDetails->specificProcs()) {
+      const Symbol &specific1{BypassGeneric(specific0)};
+      if (isSubroutine != !IsFunction(specific1)) {
+        continue;
+      }
+      const Symbol *specific{ResolveForward(specific1)};
+      if (!specific) {
+        continue;
+      }
+      if (std::optional<characteristics::Procedure> procedure{
+              characteristics::Procedure::Characterize(
+                  ProcedureDesignator{*specific}, context_.foldingContext(),
+                  /*emitError=*/false)}) {
+        ActualArguments localActuals{actuals};
+        if (specific->has<semantics::ProcBindingDetails>()) {
+          if (!adjustActuals.value()(*specific, localActuals)) {
+            continue;
+          }
+        }
+        if (semantics::CheckInterfaceForGeneric(*procedure, localActuals,
+                context_, false /* no integer conversions */) &&
+            CheckCompatibleArguments(
+                *procedure, localActuals, foldingContext_)) {
+          if ((procedure->IsElemental() && elemental) ||
+              (!procedure->IsElemental() && nonElemental)) {
+            int d{ComputeCudaMatchingDistance(
+                context_.languageFeatures(), *procedure, localActuals)};
+            if (d != crtMatchingDistance) {
+              if (d > crtMatchingDistance) {
+                continue;
+              }
+              // Matching distance is smaller than the previously matched
+              // specific. Let it go through so the current procedure is picked.
+            } else {
+              // 16.9.144(6): a bare NULL() is not allowed as an actual
+              // argument to a generic procedure if the specific procedure
+              // cannot be unambiguously distinguished
+              // Underspecified external procedure actual arguments can
+              // also lead to ambiguity.
+              return {nullptr, true /* due to ambiguity */, std::move(tried)};
+            }
+          }
+          if (!procedure->IsElemental()) {
+            // takes priority over elemental match
+            nonElemental = specific;
+          } else {
+            elemental = specific;
+          }
+          crtMatchingDistance = ComputeCudaMatchingDistance(
+              context_.languageFeatures(), *procedure, localActuals);
+        } else {
+          tried.push_back(*specific);
+        }
+      }
+    }
+  }
+  // Is there a derived type of the same name?
+  const Symbol *derivedType{nullptr};
+  if (mightBeStructureConstructor && !isSubroutine && genericDetails) {
+    if (const Symbol * dt{genericDetails->derivedType()}) {
+      const Symbol &ultimate{dt->GetUltimate()};
+      if (ultimate.has<semantics::DerivedTypeDetails>()) {
+        derivedType = &ultimate;
+      }
+    }
+  }
+
+  // Return the right resolution, if there is one.  Specific procedures
+  // declared in the generic interface are preferred over an explicit
+  // INTRINSIC of the same name, then non-elemental specifics, then
+  // elementals, then the explicit intrinsic, and lastly structure
+  // constructors.
+  if (nonElemental) {
+    return {&AccessSpecific(symbol, *nonElemental), false};
+  } else if (elemental) {
+    return {&AccessSpecific(symbol, *elemental), false};
+  } else if (explicitIntrinsic) {
+    return {explicitIntrinsic, false};
+  }
+  // Check parent derived type
+  if (const auto *parentScope{symbol.owner().GetDerivedTypeParent()}) {
+    if (const Symbol * extended{parentScope->FindComponent(symbol.name())}) {
+      auto result{ResolveGeneric(*extended, actuals, adjustActuals,
+          isSubroutine, std::move(tried), false)};
+      if (result.specific != nullptr) {
+        return result;
+      }
+      tried = std::move(result.tried);
+    }
+  }
+  // Structure constructor?
+  if (derivedType) {
+    return {derivedType, false};
+  }
+  // Check for generic or explicit INTRINSIC of the same name in outer scopes.
+  // See 15.5.5.2 for details.
+  if (!symbol.owner().IsGlobal() && !symbol.owner().IsDerivedType()) {
+    if (const Symbol *
+        outer{symbol.owner().parent().FindSymbol(symbol.name())}) {
+      auto result{ResolveGeneric(*outer, actuals, adjustActuals, isSubroutine,
+          std::move(tried), mightBeStructureConstructor)};
+      if (result.specific) {
+        return result;
+      }
+      tried = std::move(result.tried);
+    }
+  }
+  return {nullptr, false, std::move(tried)};
+}
+    -> GenericResolution {
+  const Symbol &ultimate{symbol.GetUltimate()};
+  // Check for a match with an explicit INTRINSIC
+  const Symbol *explicitIntrinsic{nullptr};
+  if (ultimate.attrs().test(semantics::Attr::INTRINSIC)) {
+    parser::Messages buffer;
+    auto restorer{GetContextualMessages().SetMessages(buffer)};
+    ActualArguments localActuals{actuals};
+    if (context_.intrinsics().Probe(
+            CallCharacteristics{ultimate.name().ToString(), isSubroutine},
+            localActuals, foldingContext_) &&
+        !buffer.AnyFatalError()) {
+      explicitIntrinsic = &ultimate;
+    }
+  }
+  const Symbol *elemental{nullptr}; // matching elemental specific proc
+  const Symbol *nonElemental{nullptr}; // matching non-elemental specific
+  const auto *genericDetails{ultimate.detailsIf<semantics::GenericDetails>()};
+<<<<<<< HEAD
   if (genericDetails && !explicitIntrinsic) {
     std::optional<CudaMatchingDistance> crtMatchingDistance;
+=======
+  if (genericDetails) {
+    int crtMatchingDistance{cudaInfMatchingValue};
+>>>>>>> 5e26bb4c8646 (update ExpressionAnalyzer::Resolution to prioritize interface over explicit intrinsics)
     for (const Symbol &specific0 : genericDetails->specificProcs()) {
       const Symbol &specific1{BypassGeneric(specific0)};
       if (isSubroutine != !IsFunction(specific1)) {
@@ -3273,15 +3407,17 @@ auto ExpressionAnalyzer::ResolveGeneric(const Symbol &symbol,
     }
   }
 
-  // Return the right resolution, if there is one.  Explicit intrinsics
-  // are preferred, then non-elements specifics, then elementals, and
-  // lastly structure constructors.
-  if (explicitIntrinsic) {
-    return {explicitIntrinsic, false};
-  } else if (nonElemental) {
+  // Return the right resolution, if there is one.  Specific procedures
+  // declared in the generic interface are preferred over an explicit
+  // INTRINSIC of the same name, then non-elemental specifics, then
+  // elementals, then the explicit intrinsic, and lastly structure
+  // constructors.
+  if (nonElemental) {
     return {&AccessSpecific(symbol, *nonElemental), false};
   } else if (elemental) {
     return {&AccessSpecific(symbol, *elemental), false};
+  } else if (explicitIntrinsic) {
+    return {explicitIntrinsic, false};
   }
   // Check parent derived type
   if (const auto *parentScope{symbol.owner().GetDerivedTypeParent()}) {
